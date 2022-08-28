@@ -7,246 +7,443 @@
 //! * Deterministic safety automaton
 
 pub(crate) mod automaton;
+pub(crate) mod monitor;
 
-use automaton::{AlternatingAutomaton, AlternatingEdge, StateId};
-use std::{fmt::Display, rc::Rc};
+use automaton::{AlternatingBüchiAutomaton, AlternatingEdges, StateId};
+use biodivine_lib_bdd::{Bdd, BddVariable, BddVariableSet, BddVariableSetBuilder};
+use itertools::Itertools;
+use maplit::hashset;
+use std::{borrow::Borrow, cell::RefCell, fmt::write, ops::Deref, rc::Rc};
 
-pub trait Domain: PartialEq + 'static {}
+pub trait Domain: 'static {}
 
-pub trait Proposition<D: Domain>: 'static {
+/// A predicate maps values from [`Domain`] to a boolean value.
+pub trait Predicate<D: Domain>: 'static {
     fn eval(&self, value: D) -> bool;
 }
 
+/// A predicate representing an equality constraint over the provided value.
 #[derive(Debug)]
-struct AtomicProposition<D: Domain> {
+struct EqPredicate<D: Domain + PartialEq> {
     value: D,
 }
 
-impl<D: Domain> Proposition<D> for AtomicProposition<D> {
+impl<D: Domain + PartialEq> Predicate<D> for EqPredicate<D> {
     fn eval(&self, value: D) -> bool {
         self.value == value
     }
 }
 
-impl<D: Domain, F: Fn(D) -> bool + 'static> Proposition<D> for F {
+impl<D: Domain, F: Fn(D) -> bool + 'static> Predicate<D> for F {
     fn eval(&self, value: D) -> bool {
         self(value)
     }
 }
 
-/// A proposition over an arbitrary expression.
-pub struct ExpressionProposition<D: Domain> {
+/// A predicate computed by the provided closure.
+pub struct ClosurePredicate<D: Domain> {
     name: &'static str,
     closure: Box<dyn Fn(D) -> bool + 'static>,
 }
 
-impl<D: Domain> Proposition<D> for ExpressionProposition<D> {
+impl<D: Domain> Predicate<D> for ClosurePredicate<D> {
     fn eval(&self, value: D) -> bool {
         (self.closure)(value)
     }
 }
 
-impl<D: Domain> std::fmt::Display for ExpressionProposition<D> {
+impl<D: Domain> std::fmt::Display for ClosurePredicate<D> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.name)
     }
 }
 
-impl<D: Domain> ExpressionProposition<D> {
-    fn make_true() -> Self {
-        Self {
-            name: "true",
-            closure: Box::new(|_| true),
+struct Predicates<D: Domain>(Vec<ClosurePredicate<D>>);
+
+pub struct PropertyBuilder<D: Domain> {
+    predicates: Predicates<D>,
+    properties: Vec<PropertyAst>,
+}
+
+#[derive(Clone)]
+pub struct PropertyBuilder2<D: Domain>(Rc<RefCell<PropertyBuilder<D>>>);
+
+impl<D: Domain> Default for Predicates<D> {
+    fn default() -> Self {
+        Self(Default::default())
+    }
+}
+
+impl<D: Domain> Predicates<D> {
+    fn new_predicate(&mut self, predicate: ClosurePredicate<D>) -> PredicateId {
+        let id = PredicateId(self.0.len());
+        self.0.push(predicate);
+        id
+    }
+}
+
+impl<D: Domain> std::ops::Index<PredicateId> for Predicates<D> {
+    type Output = ClosurePredicate<D>;
+
+    fn index(&self, index: PredicateId) -> &Self::Output {
+        &self.0[index.0]
+    }
+}
+
+impl<D: Domain> PropertyBuilder2<D> {
+    pub fn new() -> Self {
+        Self(Rc::new(RefCell::new(PropertyBuilder::new())))
+    }
+
+    pub fn new_predicate(&mut self, predicate: ClosurePredicate<D>) -> PredicateId {
+        self.0.borrow_mut().new_predicate(predicate)
+    }
+
+    pub fn atomic(&mut self, predicate: PredicateId) -> Property<D> {
+        Property {
+            builder: self.0.clone(),
+            property: self.0.borrow_mut().atomic(predicate),
         }
+    }
+}
+
+impl<D: Domain> PropertyBuilder<D> {
+    fn new() -> Self {
+        Self {
+            predicates: Predicates::default(),
+            properties: Vec::default(),
+        }
+    }
+
+    fn new_predicate(&mut self, predicate: ClosurePredicate<D>) -> PredicateId {
+        self.predicates.new_predicate(predicate)
+    }
+
+    fn add(&mut self, ast: PropertyAst) -> PropertyId {
+        let id = PropertyId(self.properties.len());
+        self.properties.push(ast);
+        id
+    }
+
+    fn atomic(&mut self, predicate: PredicateId) -> PropertyId {
+        self.add(PropertyAst::Atomic(predicate))
+    }
+
+    fn not(&mut self, property: PropertyId) -> PropertyId {
+        self.add(PropertyAst::Not(property))
+    }
+
+    fn and(&mut self, left: PropertyId, right: PropertyId) -> PropertyId {
+        self.add(PropertyAst::And(left, right))
+    }
+
+    fn or(&mut self, left: PropertyId, right: PropertyId) -> PropertyId {
+        self.add(PropertyAst::Or(left, right))
+    }
+
+    fn implies(&mut self, premise: PropertyId, conclusion: PropertyId) -> PropertyId {
+        let premise = self.add(PropertyAst::Not(premise));
+        self.add(PropertyAst::Or(premise, conclusion))
+    }
+
+    fn always(&mut self, property: PropertyId) -> PropertyId {
+        self.add(PropertyAst::Always(property))
+    }
+
+    fn finally(&mut self, property: PropertyId) -> PropertyId {
+        self.add(PropertyAst::Finally(property))
+    }
+
+    fn next(&mut self, property: PropertyId) -> PropertyId {
+        self.add(PropertyAst::Next(property))
+    }
+
+    fn bdd_variables(&self) -> (Vec<BddVariable>, BddVariableSet) {
+        let mut builder = BddVariableSetBuilder::new();
+        let variables = self
+            .predicates
+            .0
+            .iter()
+            .map(|proposition| builder.make_variable(&format!("{proposition}")))
+            .collect();
+        (variables, builder.build())
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct PropertyId(usize);
+pub struct PredicateId(usize);
 
-#[derive(Clone)]
-pub enum Property<D: Domain> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PropertyId(usize);
+
+#[derive(Debug, Clone, Copy)]
+enum PropertyAst {
     // boolean
-    Atomic(Rc<ExpressionProposition<D>>),
-    Not(Rc<Self>),
-    And(Rc<Self>, Rc<Self>),
-    Or(Rc<Self>, Rc<Self>),
+    Atomic(PredicateId),
+    Not(PropertyId),
+    And(PropertyId, PropertyId),
+    Or(PropertyId, PropertyId),
 
     // temporal
-    Always(Rc<Self>),
-    Finally(Rc<Self>),
-    Next(Rc<Self>),
+    Always(PropertyId),
+    Finally(PropertyId),
+    Next(PropertyId),
 }
 
-impl<D: Domain> Property<D> {
-    fn atomic(expr: ExpressionProposition<D>) -> Self {
-        Self::Atomic(Rc::new(expr))
-    }
+#[derive(Clone)]
+pub struct Property<D: Domain> {
+    builder: Rc<RefCell<PropertyBuilder<D>>>,
+    property: PropertyId,
+}
 
-    fn not<I: Into<Self>>(inner: I) -> Self {
-        Self::Not(Rc::new(inner.into()))
-    }
+impl<D: Domain> std::ops::BitAnd for Property<D> {
+    type Output = Self;
 
-    fn implies<C>(self, conclusion: C) -> Self
-    where
-        C: Into<Self>,
-    {
-        Self::Or(
-            Rc::new(Self::Not(Rc::new(self))),
-            Rc::new(conclusion.into()),
-        )
+    fn bitand(self, rhs: Self) -> Self::Output {
+        Self {
+            builder: self.builder.clone(),
+            property: self.builder.borrow_mut().and(self.property, rhs.property),
+        }
     }
+}
 
-    fn or<C>(self, other: C) -> Self
-    where
-        C: Into<Self>,
-    {
-        Self::Or(Rc::new(self), Rc::new(other.into()))
-    }
+impl<D: Domain> std::ops::Not for Property<D> {
+    type Output = Self;
 
-    fn and<C>(self, other: C) -> Self
-    where
-        C: Into<Self>,
-    {
-        Self::And(Rc::new(self), Rc::new(other.into()))
-    }
-
-    fn always<I: Into<Self>>(inner: I) -> Self {
-        Self::Always(Rc::new(inner.into()))
-    }
-
-    fn next(inner: Self) -> Self {
-        Self::Next(Rc::new(inner))
+    fn not(self) -> Self::Output {
+        Self {
+            builder: self.builder.clone(),
+            property: self.builder.borrow_mut().not(self.property),
+        }
     }
 }
 
 impl<D: Domain> Property<D> {
-    fn is_in_nnf(&self) -> bool {
-        match self {
-            Property::Atomic(_) => true,
-            Property::Not(subf) => match subf.as_ref() {
-                Property::Atomic(_) => true,
-                _ => false,
-            },
-            Property::And(lhs, rhs) | Property::Or(lhs, rhs) => lhs.is_in_nnf() && rhs.is_in_nnf(),
-            Property::Always(subf) | Property::Finally(subf) | Property::Next(subf) => {
-                subf.is_in_nnf()
-            }
+    pub fn implies(&self, conclusion: &Self) -> Self {
+        assert!(std::rc::Rc::ptr_eq(&self.builder, &conclusion.builder));
+        Self {
+            builder: self.builder.clone(),
+            property: self
+                .builder
+                .borrow_mut()
+                .implies(self.property, conclusion.property),
         }
     }
 
-    fn to_nnf(&self) -> Self {
-        self.to_nnf_core(false)
+    pub fn next(property: &Self) -> Self {
+        Self {
+            builder: property.builder.clone(),
+            property: property.builder.borrow_mut().next(property.property),
+        }
     }
 
-    fn to_nnf_core(&self, negated: bool) -> Self {
-        match self {
-            Property::Atomic(a) => {
-                if negated {
-                    Self::Not(Rc::new(Property::Atomic(a.clone())))
-                } else {
-                    Property::Atomic(a.clone())
-                }
-            }
-            Property::Not(subf) => subf.to_nnf_core(!negated),
-            Property::And(lhs, rhs) => {
-                let lhs = Rc::new(lhs.to_nnf_core(negated));
-                let rhs = Rc::new(rhs.to_nnf_core(negated));
-                if negated {
-                    Property::Or(lhs, rhs)
-                } else {
-                    Property::And(lhs, rhs)
-                }
-            }
-            Property::Or(lhs, rhs) => {
-                let lhs = Rc::new(lhs.to_nnf_core(negated));
-                let rhs = Rc::new(rhs.to_nnf_core(negated));
-                if negated {
-                    Property::And(lhs, rhs)
-                } else {
-                    Property::Or(lhs, rhs)
-                }
-            }
-            Property::Always(subf) => {
-                let subf = Rc::new(subf.to_nnf_core(negated));
-                if negated {
-                    Property::Finally(subf)
-                } else {
-                    Property::Always(subf)
-                }
-            }
-            Property::Finally(subf) => {
-                let subf = Rc::new(subf.to_nnf_core(negated));
-                if negated {
-                    Property::Always(subf)
-                } else {
-                    Property::Finally(subf)
-                }
-            }
-            Property::Next(subf) => {
-                let subf = Rc::new(subf.to_nnf_core(negated));
-                Property::Next(subf)
-            }
+    pub fn always(property: &Self) -> Self {
+        Self {
+            builder: property.builder.clone(),
+            property: property.builder.borrow_mut().always(property.property),
         }
+    }
+
+    pub fn finally(property: &Self) -> Self {
+        Self {
+            builder: property.builder.clone(),
+            property: property.builder.borrow_mut().finally(property.property),
+        }
+    }
+
+    /// Returns true when the formula is in negation normal form.
+    pub fn is_nnf(&self) -> bool {
+        self.builder.deref().borrow().is_in_nnf(self.property)
+    }
+
+    /// Returns a new formula that accepts the same language and is in
+    /// negation normal form. The size of the new formula is at most
+    /// 2 times larger than the original formula.
+    pub fn to_nnf(&self) -> Self {
+        let property = self.builder.deref().borrow_mut().to_nnf(self.property);
+        Self {
+            builder: self.builder.clone(),
+            property,
+        }
+    }
+
+    pub(crate) fn to_alternating_büchi(&self) -> AlternatingBüchiAutomaton {
+        self.builder
+            .deref()
+            .borrow()
+            .to_alternating_büchi(self.property)
     }
 }
 
 impl<D: Domain> std::fmt::Display for Property<D> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Property::Atomic(expr) => write!(f, "({})", expr),
-            Property::Not(subf) => write!(f, "¬{}", subf),
-            Property::And(lhs, rhs) => write!(f, "({} ∧ {})", lhs, rhs),
-            Property::Or(lhs, rhs) => write!(f, "({} ∨ {})", lhs, rhs),
-            Property::Always(subf) => write!(f, "G {}", subf),
-            Property::Finally(subf) => write!(f, "F {}", subf),
-            Property::Next(subf) => write!(f, "X {}", subf),
+        let builder = self.builder.deref().borrow();
+        write!(f, "{}", builder.to_string(self.property))
+    }
+}
+
+impl<D: Domain> PropertyBuilder<D> {
+    fn is_in_nnf(&self, property: PropertyId) -> bool {
+        match self.properties[property.0] {
+            PropertyAst::Atomic(_) => true,
+            PropertyAst::Not(subf) => match self.properties[subf.0] {
+                PropertyAst::Atomic(_) => true,
+                _ => false,
+            },
+            PropertyAst::And(lhs, rhs) | PropertyAst::Or(lhs, rhs) => {
+                self.is_in_nnf(lhs) && self.is_in_nnf(rhs)
+            }
+            PropertyAst::Always(subf) | PropertyAst::Finally(subf) | PropertyAst::Next(subf) => {
+                self.is_in_nnf(subf)
+            }
+        }
+    }
+
+    fn to_nnf(&mut self, property: PropertyId) -> PropertyId {
+        self.to_nnf_core(property, false)
+    }
+
+    fn to_nnf_core(&mut self, property: PropertyId, negated: bool) -> PropertyId {
+        match self.properties[property.0] {
+            PropertyAst::Atomic(a) => {
+                if negated {
+                    self.add(PropertyAst::Not(property))
+                } else {
+                    property
+                }
+            }
+            PropertyAst::Not(subf) => self.to_nnf_core(subf, !negated),
+            PropertyAst::And(lhs, rhs) => {
+                let lhs = self.to_nnf_core(lhs, negated);
+                let rhs = self.to_nnf_core(rhs, negated);
+                self.add(if negated {
+                    PropertyAst::Or(lhs, rhs)
+                } else {
+                    PropertyAst::And(lhs, rhs)
+                })
+            }
+            PropertyAst::Or(lhs, rhs) => {
+                let lhs = self.to_nnf_core(lhs, negated);
+                let rhs = self.to_nnf_core(rhs, negated);
+                self.add(if negated {
+                    PropertyAst::And(lhs, rhs)
+                } else {
+                    PropertyAst::Or(lhs, rhs)
+                })
+            }
+            PropertyAst::Always(subf) => {
+                let subf = self.to_nnf_core(subf, negated);
+                self.add(if negated {
+                    PropertyAst::Finally(subf)
+                } else {
+                    PropertyAst::Always(subf)
+                })
+            }
+            PropertyAst::Finally(subf) => {
+                let subf = self.to_nnf_core(subf, negated);
+                self.add(if negated {
+                    PropertyAst::Always(subf)
+                } else {
+                    PropertyAst::Finally(subf)
+                })
+            }
+            PropertyAst::Next(subf) => {
+                let subf = self.to_nnf_core(subf, negated);
+                self.add(PropertyAst::Next(subf))
+            }
         }
     }
 }
 
-impl<D: Domain> Property<D> {
-    fn to_alternating_büchi(&self) -> AlternatingAutomaton<D> {
-        assert!(self.is_in_nnf());
-        let mut automaton = AlternatingAutomaton::new_büchi();
-        let initial_state = self.to_alternating_büchi_state(&mut automaton);
-        automaton.set_initial(initial_state);
+impl<D: Domain> PropertyBuilder<D> {
+    fn to_string(&self, property: PropertyId) -> String {
+        match self.properties[property.0] {
+            PropertyAst::Atomic(expr) => format!("({})", self.predicates[expr]),
+            PropertyAst::Not(subf) => format!("!{}", self.to_string(subf)),
+            PropertyAst::And(lhs, rhs) => {
+                format!("({} & {})", self.to_string(lhs), self.to_string(rhs))
+            }
+            PropertyAst::Or(lhs, rhs) => {
+                format!("({} | {})", self.to_string(lhs), self.to_string(rhs))
+            }
+            PropertyAst::Always(subf) => format!("G {}", self.to_string(subf)),
+            PropertyAst::Finally(subf) => format!("F {}", self.to_string(subf)),
+            PropertyAst::Next(subf) => format!("X {}", self.to_string(subf)),
+        }
+    }
+}
 
+impl<D: Domain> PropertyBuilder<D> {
+    fn to_alternating_büchi(&self, property: PropertyId) -> AlternatingBüchiAutomaton {
+        assert!(self.is_in_nnf(property));
+        let (variables, set) = self.bdd_variables();
+        let mut automaton = AlternatingBüchiAutomaton::new_büchi(&set);
+        let initial_state =
+            self.to_alternating_büchi_state(&variables, &set, &mut automaton, property);
+        automaton.set_initial(initial_state);
         automaton
     }
 
-    fn to_alternating_büchi_state(&self, automaton: &mut AlternatingAutomaton<D>) -> StateId {
-        let state = automaton.new_state(Some(&format!("{}", self)));
-        match self {
-            Property::Atomic(expr) => {
-                automaton.add_edge(state, (expr.clone(), vec![automaton.accepting_sink()]))
-            }
-            Property::Not(_) => todo!(),
-            Property::And(_, _) => todo!(),
-            Property::Or(lhs, rhs) => {
-                let lhs = lhs.to_alternating_büchi_edge(automaton);
-                let rhs = rhs.to_alternating_büchi_edge(automaton);
-                for edge in lhs.iter().chain(&rhs) {
-                    automaton.add_edge(state, edge.clone());
+    fn to_alternating_büchi_state(
+        &self,
+        variables: &[BddVariable],
+        set: &BddVariableSet,
+        automaton: &mut AlternatingBüchiAutomaton,
+        property: PropertyId,
+    ) -> StateId {
+        let state = automaton.new_state(Some(&self.to_string(property)));
+        match self.properties[property.0] {
+            PropertyAst::Atomic(prop) => automaton.add_edge(
+                state,
+                set.mk_literal(variables[prop.0], true),
+                hashset! {automaton.accepting_sink()},
+            ),
+            PropertyAst::Not(subf) => match self.properties[subf.0] {
+                PropertyAst::Atomic(prop) => automaton.add_edge(
+                    state,
+                    set.mk_literal(variables[prop.0], false),
+                    hashset! {automaton.accepting_sink()},
+                ),
+                _ => unreachable!("formula is in negation normal form"),
+            },
+            PropertyAst::And(lhs, rhs) => {
+                let lhs = self.to_alternating_büchi_edge(variables, set, automaton, lhs);
+                let rhs = self.to_alternating_büchi_edge(variables, set, automaton, rhs);
+                for ((left_guard, left_target), (right_guard, right_target)) in
+                    lhs.iter().cartesian_product(&rhs)
+                {
+                    let guard = left_guard.and(right_guard);
+                    let target = left_target.iter().chain(right_target).copied().collect();
+                    automaton.add_edge(state, guard, target);
                 }
             }
-            Property::Always(subf) => {
-                let edges = subf.to_alternating_büchi_edge(automaton);
-                for mut edge in edges {
+            PropertyAst::Or(lhs, rhs) => {
+                let lhs = self.to_alternating_büchi_edge(variables, set, automaton, lhs);
+                let rhs = self.to_alternating_büchi_edge(variables, set, automaton, rhs);
+                for (guard, target) in lhs.iter().chain(&rhs) {
+                    automaton.add_edge(state, guard.clone(), target.clone());
+                }
+            }
+            PropertyAst::Always(subf) => {
+                let edges = self.to_alternating_büchi_edge(variables, set, automaton, subf);
+                for (guard, mut target) in edges {
                     // since the constraint is conjunctive, we can remove edges to the accepting sink
-                    edge.1.retain(|&s| s != automaton.accepting_sink());
-                    edge.1.push(state);
-                    automaton.add_edge(state, edge);
+                    target.retain(|&s| s != automaton.accepting_sink());
+                    target.insert(state);
+                    automaton.add_edge(state, guard, target);
                 }
                 automaton.add_accepting(state);
             }
-            Property::Finally(_) => todo!(),
-            Property::Next(subf) => {
-                let next_state = subf.to_alternating_büchi_state(automaton);
-                automaton.add_edge(
-                    state,
-                    (ExpressionProposition::make_true().into(), vec![next_state]),
-                );
+            PropertyAst::Finally(subf) => {
+                let edges = self.to_alternating_büchi_edge(variables, set, automaton, subf);
+                for (guard, target) in edges {
+                    automaton.add_edge(state, guard, target);
+                }
+                automaton.add_edge(state, set.mk_true(), hashset! {state});
+            }
+            PropertyAst::Next(subf) => {
+                let next_state = self.to_alternating_büchi_state(variables, set, automaton, subf);
+                automaton.add_edge(state, set.mk_true(), hashset! {next_state});
             }
         }
 
@@ -255,25 +452,39 @@ impl<D: Domain> Property<D> {
 
     fn to_alternating_büchi_edge(
         &self,
-        automaton: &mut AlternatingAutomaton<D>,
-    ) -> AlternatingEdge<D> {
-        match self {
-            Property::Atomic(expr) => {
-                return vec![(expr.clone(), vec![automaton.accepting_sink()])];
+        variables: &[BddVariable],
+        set: &BddVariableSet,
+        automaton: &mut AlternatingBüchiAutomaton,
+        property: PropertyId,
+    ) -> AlternatingEdges {
+        match self.properties[property.0] {
+            PropertyAst::Atomic(prop) => {
+                return vec![(
+                    set.mk_literal(variables[prop.0], true),
+                    hashset! {automaton.accepting_sink()},
+                )];
             }
-            Property::Not(_) => todo!(),
-            Property::And(_, _) => todo!(),
-            Property::Or(lhs, rhs) => {
-                let mut lhs = lhs.to_alternating_büchi_edge(automaton);
-                let mut rhs = rhs.to_alternating_büchi_edge(automaton);
+            PropertyAst::Not(subf) => match self.properties[subf.0] {
+                PropertyAst::Atomic(prop) => {
+                    return vec![(
+                        set.mk_literal(variables[prop.0], false),
+                        hashset! {automaton.accepting_sink()},
+                    )];
+                }
+                _ => unreachable!("formula is in negation normal form"),
+            },
+            PropertyAst::And(_, _) => todo!(),
+            PropertyAst::Or(lhs, rhs) => {
+                let mut lhs = self.to_alternating_büchi_edge(variables, set, automaton, lhs);
+                let mut rhs = self.to_alternating_büchi_edge(variables, set, automaton, rhs);
                 lhs.append(&mut rhs);
                 return lhs;
             }
-            Property::Always(_) => todo!(),
-            Property::Finally(_) => todo!(),
-            Property::Next(subf) => {
-                let state = subf.to_alternating_büchi_state(automaton);
-                return vec![(ExpressionProposition::make_true().into(), vec![state])];
+            PropertyAst::Always(_) => todo!(),
+            PropertyAst::Finally(_) => todo!(),
+            PropertyAst::Next(subf) => {
+                let state = self.to_alternating_büchi_state(variables, set, automaton, subf);
+                return vec![(set.mk_true(), hashset! {state})];
             }
         }
     }
@@ -281,9 +492,8 @@ impl<D: Domain> Property<D> {
 
 #[cfg(test)]
 mod tests {
-    use crate::automaton::Automaton;
-
     use super::*;
+    use crate::automaton::{NonDeterministicBüchiAutomaton, NonDeterministicSafetyAutomaton};
 
     #[test]
     fn simple() {
@@ -295,42 +505,48 @@ mod tests {
 
         impl Domain for Observation {}
 
-        // let eq_b = ExpressionProposition {
-        //     name: "obs == B",
-        //     closure: Box::new(|p| p == Observation::B),
-        // };
-        let neq_b = ExpressionProposition {
-            name: "obs != B",
-            closure: Box::new(|p| p != Observation::B),
-        };
-        // let eq_a = ExpressionProposition {
-        //     name: "obs == A",
-        //     closure: Box::new(|p| p == Observation::A),
-        // };
-        let neq_a = ExpressionProposition {
-            name: "obs != A",
-            closure: Box::new(|p| p != Observation::A),
-        };
+        let mut builder = PropertyBuilder2::new();
+        let eq_a = builder.new_predicate(ClosurePredicate {
+            name: "obs is equal to A",
+            closure: Box::new(|p: Observation| p == Observation::A),
+        });
+        let eq_b = builder.new_predicate(ClosurePredicate {
+            name: "obs is equal to B",
+            closure: Box::new(|p| p == Observation::B),
+        });
 
-        // let prop: Property<Observation> = Property::always(Property::atomic(eq_b).implies(
-        //     Property::next(Property::always(Property::not(Property::atomic(eq_a)))),
-        // ));
-        // let prop: Property<Observation> =
-        //     Property::next(Property::or(Property::atomic(eq_a), Property::atomic(eq_b)));
-        // let prop: Property<Observation> = Property::always(Property::atomic(eq_b));
-        let prop: Property<Observation> = Property::always(
-            Property::atomic(neq_b).or(Property::next(Property::always(Property::atomic(neq_a)))),
+        let prop = Property::always(
+            &builder
+                .atomic(eq_b)
+                .implies(&Property::next(&Property::always(&!builder.atomic(eq_a)))),
         );
+        // let prop = Property::finally(&builder.atomic(eq_a));
 
-        println!("{}", prop);
-        println!("{}", prop.to_nnf());
+        println!("{prop}");
 
-        let büchi = prop.to_nnf().to_alternating_büchi();
+        let nnf = prop.to_nnf();
+        println!("{prop}");
+
+        let büchi = nnf.to_alternating_büchi();
         let mut s = Vec::new();
         dot::render(&büchi, &mut s).unwrap();
         let s = String::from_utf8(s).unwrap();
         println!("{s}");
-        let büchi = Automaton::from(&büchi);
+        let büchi = NonDeterministicBüchiAutomaton::from(&büchi);
+        let mut s = Vec::new();
+        dot::render(&büchi, &mut s).unwrap();
+        let s = String::from_utf8(s).unwrap();
+        println!("{s}");
+
+        let safety = NonDeterministicSafetyAutomaton::from(&büchi);
+        println!("deterministic: {}", safety.is_deterministic());
+        let safety = safety.determinize();
+        let safety = safety.minimize();
+
+        let mut s = Vec::new();
+        dot::render(&safety, &mut s).unwrap();
+        let s = String::from_utf8(s).unwrap();
+        println!("{s}");
 
         panic!();
 
