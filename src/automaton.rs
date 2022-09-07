@@ -1,6 +1,6 @@
 //! Alternating automaton
 
-use biodivine_lib_bdd::{Bdd, BddVariableSet};
+use biodivine_lib_bdd::{Bdd, BddValuation, BddVariableSet};
 use bitvec::vec::BitVec;
 use itertools::Itertools;
 use maplit::{hashmap, hashset};
@@ -9,7 +9,6 @@ use std::{
     fmt::Debug,
 };
 
-mod alternating;
 mod dot;
 
 #[derive(Clone)]
@@ -21,7 +20,8 @@ pub(crate) struct Automaton<Edg, Acc> {
     variables: BddVariableSet,
 }
 
-pub(crate) type AlternatingEdges = Vec<(Bdd, HashSet<StateId>)>;
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Alternating(Vec<(Bdd, HashSet<StateId>)>);
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct NonDeterministic(HashMap<StateId, Bdd>);
@@ -37,7 +37,7 @@ pub(crate) struct Büchi(Vec<StateId>);
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Safety(());
 
-pub(crate) type AlternatingBüchiAutomaton = Automaton<AlternatingEdges, Büchi>;
+pub(crate) type AlternatingBüchiAutomaton = Automaton<Alternating, Büchi>;
 pub(crate) type NonDeterministicBüchiAutomaton = Automaton<NonDeterministic, Büchi>;
 pub(crate) type NonDeterministicSafetyAutomaton = Automaton<NonDeterministic, Safety>;
 pub(crate) type DeterministicSafetyAutomaton = Automaton<Deterministic, Safety>;
@@ -67,6 +67,10 @@ impl<Edg: Default, Acc> Automaton<Edg, Acc> {
     pub(crate) fn set_initial(&mut self, state: StateId) {
         self.initial_state = state;
     }
+
+    pub(crate) fn get_initial(&self) -> StateId {
+        self.initial_state
+    }
 }
 
 impl<Acc> Automaton<NonDeterministic, Acc> {
@@ -82,19 +86,19 @@ impl<Acc> Automaton<NonDeterministic, Acc> {
     }
 }
 
-impl<Acc> Automaton<AlternatingEdges, Acc> {
+impl<Acc> Automaton<Alternating, Acc> {
     pub(crate) fn add_edge(&mut self, state: StateId, guard: Bdd, target: HashSet<StateId>) {
         if guard.is_false() {
             return;
         }
         // check if there is an existing edge with the same target
-        for (other_guard, other_target) in &mut self.transitions[state.0] {
+        for (other_guard, other_target) in &mut self.transitions[state.0].0 {
             if target == *other_target {
                 *other_guard = other_guard.or(&guard);
                 return;
             }
         }
-        self.transitions[state.0].push((guard, target));
+        self.transitions[state.0].0.push((guard, target));
     }
 }
 
@@ -120,6 +124,14 @@ impl<Acc> Automaton<Deterministic, Acc> {
             .or_insert_with(|| self.variables.mk_false());
         *entry = entry.or(&guard);
     }
+
+    pub(crate) fn next_state(&self, state: StateId, valuation: &BddValuation) -> Option<StateId> {
+        self.transitions[state.0]
+            .0
+            .iter()
+            .find(|(_, guard)| guard.eval_in(valuation))
+            .map(|(target, _)| *target)
+    }
 }
 
 impl<Edg> Automaton<Edg, Büchi> {
@@ -136,7 +148,10 @@ impl AlternatingBüchiAutomaton {
                 id: StateId(0),
                 name: Some("true".to_string()),
             }],
-            transitions: vec![vec![(variables.mk_true(), hashset! {StateId(0)})]],
+            transitions: vec![Alternating(vec![(
+                variables.mk_true(),
+                hashset! {StateId(0)},
+            )])],
             acceptance: Büchi(vec![StateId(0)]),
             variables: variables.clone(),
         }
@@ -193,6 +208,7 @@ impl NonDeterministicBüchiAutomaton {
                 .iter()
                 .map(|s| {
                     alternating.transitions[s.0]
+                        .0
                         .iter()
                         .zip(std::iter::repeat(state.1.contains(s)))
                 })
@@ -403,7 +419,7 @@ impl NonDeterministicSafetyAutomaton {
 
     /// Creates a new deterministic automaton that accepts the same language.
     pub(crate) fn determinize(&self) -> DeterministicSafetyAutomaton {
-        let initial_state = PowerState::singleton(&self, self.initial_state);
+        let initial_state = PowerState::singleton(self, self.initial_state);
         let formatted = format!("{initial_state}");
         let mut automaton =
             DeterministicSafetyAutomaton::new_with_state(&self.variables, Some(&formatted));
@@ -449,7 +465,7 @@ impl NonDeterministicSafetyAutomaton {
                     format_bdd(&guard, &automaton.variables),
                     targets
                 );
-                let targets = PowerState::from(&self, &targets);
+                let targets = PowerState::from(self, &targets);
                 let formatted = format!("{targets}");
                 let target = *mapping.entry(targets.clone()).or_insert_with(|| {
                     let id = automaton.new_state(Some(&formatted));
@@ -464,10 +480,23 @@ impl NonDeterministicSafetyAutomaton {
 }
 
 impl DeterministicSafetyAutomaton {
+    pub(crate) fn new_invariant(variables: BddVariableSet, invariant: Bdd) -> Self {
+        Self {
+            initial_state: StateId(0),
+            states: vec![State {
+                id: StateId(0),
+                name: None,
+            }],
+            transitions: vec![Deterministic(hashmap! {StateId(0) => invariant})],
+            acceptance: Safety(()),
+            variables,
+        }
+    }
+
     /// Minimizes the number of states of a deterministic automaton.
     pub(crate) fn minimize(&self) -> Self {
         // initially, all states start in the same equivalence class
-        let mut equivalence_classes = vec![PowerState::all(&self)];
+        let mut equivalence_classes = vec![PowerState::all(self)];
         let mut new_equivalence_classes = Vec::new();
         loop {
             for class in &equivalence_classes {
@@ -475,8 +504,8 @@ impl DeterministicSafetyAutomaton {
                     .iter()
                     .next()
                     .expect("equivalence classes are not empty");
-                let mut new_equiv = PowerState::singleton(&self, pivot);
-                let mut other_equiv = PowerState::empty(&self);
+                let mut new_equiv = PowerState::singleton(self, pivot);
+                let mut other_equiv = PowerState::empty(self);
 
                 // compare every other state in the class with our pivot
                 for other in class.iter().skip(1) {
@@ -540,10 +569,9 @@ impl DeterministicSafetyAutomaton {
 
         for class in &equivalence_classes {
             println!("{class}");
-            let state_id = *mapping.entry(class.clone()).or_insert_with(|| {
-                let id = automaton.new_state(Some(&format!("{class}")));
-                id
-            });
+            let state_id = *mapping
+                .entry(class.clone())
+                .or_insert_with(|| automaton.new_state(Some(&format!("{class}"))));
             for state in class.iter() {
                 dbg!(&state);
                 for (target, guard) in &self.transitions[state.0].0 {
@@ -551,11 +579,9 @@ impl DeterministicSafetyAutomaton {
                         .iter()
                         .find(|class| class.contains(*target))
                         .expect("every state is in exactly one equivalence class");
-                    let target_state_id =
-                        *mapping.entry(target_class.clone()).or_insert_with(|| {
-                            let id = automaton.new_state(Some(&format!("{target_class}")));
-                            id
-                        });
+                    let target_state_id = *mapping
+                        .entry(target_class.clone())
+                        .or_insert_with(|| automaton.new_state(Some(&format!("{target_class}"))));
                     automaton.add_edge(state_id, guard.clone(), target_state_id);
                 }
             }
@@ -569,7 +595,7 @@ impl<'a> IntoIterator for &'a Deterministic {
     type IntoIter = std::collections::hash_map::Iter<'a, StateId, Bdd>;
 
     fn into_iter(self) -> Self::IntoIter {
-        (&self.0).into_iter()
+        (&self.0).iter()
     }
 }
 
@@ -578,7 +604,7 @@ impl<'a> IntoIterator for &'a NonDeterministic {
     type IntoIter = std::collections::hash_map::Iter<'a, StateId, Bdd>;
 
     fn into_iter(self) -> Self::IntoIter {
-        (&self.0).into_iter()
+        (&self.0).iter()
     }
 }
 

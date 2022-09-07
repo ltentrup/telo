@@ -6,20 +6,23 @@
 //! * Alternating-time safety automaton
 //! * Deterministic safety automaton
 
+#![deny(clippy::all)]
+#![warn(clippy::pedantic, clippy::nursery, clippy::cargo)]
+
 pub(crate) mod automaton;
 pub(crate) mod monitor;
 
-use automaton::{AlternatingBüchiAutomaton, AlternatingEdges, StateId};
-use biodivine_lib_bdd::{Bdd, BddVariable, BddVariableSet, BddVariableSetBuilder};
+use automaton::{AlternatingBüchiAutomaton, StateId};
+use biodivine_lib_bdd::{Bdd, BddValuation, BddVariable, BddVariableSet, BddVariableSetBuilder};
 use itertools::Itertools;
 use maplit::hashset;
-use std::{borrow::Borrow, cell::RefCell, fmt::write, ops::Deref, rc::Rc};
+use std::{cell::RefCell, collections::HashSet, ops::Deref, rc::Rc};
 
 pub trait Domain: 'static {}
 
 /// A predicate maps values from [`Domain`] to a boolean value.
 pub trait Predicate<D: Domain>: 'static {
-    fn eval(&self, value: D) -> bool;
+    fn eval(&self, value: &D) -> bool;
 }
 
 /// A predicate representing an equality constraint over the provided value.
@@ -29,13 +32,13 @@ struct EqPredicate<D: Domain + PartialEq> {
 }
 
 impl<D: Domain + PartialEq> Predicate<D> for EqPredicate<D> {
-    fn eval(&self, value: D) -> bool {
-        self.value == value
+    fn eval(&self, value: &D) -> bool {
+        self.value == *value
     }
 }
 
-impl<D: Domain, F: Fn(D) -> bool + 'static> Predicate<D> for F {
-    fn eval(&self, value: D) -> bool {
+impl<D: Domain, F: Fn(&D) -> bool + 'static> Predicate<D> for F {
+    fn eval(&self, value: &D) -> bool {
         self(value)
     }
 }
@@ -43,11 +46,11 @@ impl<D: Domain, F: Fn(D) -> bool + 'static> Predicate<D> for F {
 /// A predicate computed by the provided closure.
 pub struct ClosurePredicate<D: Domain> {
     name: &'static str,
-    closure: Box<dyn Fn(D) -> bool + 'static>,
+    closure: Box<dyn Fn(&D) -> bool + 'static>,
 }
 
 impl<D: Domain> Predicate<D> for ClosurePredicate<D> {
-    fn eval(&self, value: D) -> bool {
+    fn eval(&self, value: &D) -> bool {
         (self.closure)(value)
     }
 }
@@ -58,7 +61,13 @@ impl<D: Domain> std::fmt::Display for ClosurePredicate<D> {
     }
 }
 
-struct Predicates<D: Domain>(Vec<ClosurePredicate<D>>);
+struct PredicatesBuilder<D: Domain>(Vec<ClosurePredicate<D>>);
+
+pub struct Predicates<D: Domain> {
+    predicates: Vec<ClosurePredicate<D>>,
+    variables: Vec<BddVariable>,
+    manager: BddVariableSet,
+}
 
 pub struct PropertyBuilder<D: Domain> {
     predicates: Predicates<D>,
@@ -68,17 +77,54 @@ pub struct PropertyBuilder<D: Domain> {
 #[derive(Clone)]
 pub struct PropertyBuilder2<D: Domain>(Rc<RefCell<PropertyBuilder<D>>>);
 
-impl<D: Domain> Default for Predicates<D> {
+impl<D: Domain> Default for PredicatesBuilder<D> {
     fn default() -> Self {
-        Self(Default::default())
+        Self(Vec::default())
     }
 }
 
 impl<D: Domain> Predicates<D> {
+    fn builder() -> PredicatesBuilder<D> {
+        PredicatesBuilder::default()
+    }
+
+    fn evaluate(&self, observation: &D) -> BddValuation {
+        BddValuation::new(
+            self.predicates
+                .iter()
+                .map(|predicate| predicate.eval(observation))
+                .collect(),
+        )
+    }
+
+    fn bdd_variable(&self, predicate: PredicateId) -> &BddVariable {
+        &self.variables[predicate.0]
+    }
+
+    fn bdd_manager(&self) -> &BddVariableSet {
+        &self.manager
+    }
+}
+
+impl<D: Domain> PredicatesBuilder<D> {
     fn new_predicate(&mut self, predicate: ClosurePredicate<D>) -> PredicateId {
         let id = PredicateId(self.0.len());
         self.0.push(predicate);
         id
+    }
+
+    fn build(self) -> Predicates<D> {
+        let mut builder = BddVariableSetBuilder::new();
+        let variables = self
+            .0
+            .iter()
+            .map(|proposition| builder.make_variable(&format!("{proposition}")))
+            .collect();
+        Predicates {
+            predicates: self.0,
+            variables,
+            manager: builder.build(),
+        }
     }
 }
 
@@ -86,17 +132,13 @@ impl<D: Domain> std::ops::Index<PredicateId> for Predicates<D> {
     type Output = ClosurePredicate<D>;
 
     fn index(&self, index: PredicateId) -> &Self::Output {
-        &self.0[index.0]
+        &self.predicates[index.0]
     }
 }
 
 impl<D: Domain> PropertyBuilder2<D> {
-    pub fn new() -> Self {
-        Self(Rc::new(RefCell::new(PropertyBuilder::new())))
-    }
-
-    pub fn new_predicate(&mut self, predicate: ClosurePredicate<D>) -> PredicateId {
-        self.0.borrow_mut().new_predicate(predicate)
+    pub fn new(predicates: Predicates<D>) -> Self {
+        Self(Rc::new(RefCell::new(PropertyBuilder::new(predicates))))
     }
 
     pub fn atomic(&mut self, predicate: PredicateId) -> Property<D> {
@@ -108,15 +150,11 @@ impl<D: Domain> PropertyBuilder2<D> {
 }
 
 impl<D: Domain> PropertyBuilder<D> {
-    fn new() -> Self {
+    fn new(predicates: Predicates<D>) -> Self {
         Self {
-            predicates: Predicates::default(),
+            predicates,
             properties: Vec::default(),
         }
-    }
-
-    fn new_predicate(&mut self, predicate: ClosurePredicate<D>) -> PredicateId {
-        self.predicates.new_predicate(predicate)
     }
 
     fn add(&mut self, ast: PropertyAst) -> PropertyId {
@@ -158,16 +196,16 @@ impl<D: Domain> PropertyBuilder<D> {
         self.add(PropertyAst::Next(property))
     }
 
-    fn bdd_variables(&self) -> (Vec<BddVariable>, BddVariableSet) {
-        let mut builder = BddVariableSetBuilder::new();
-        let variables = self
-            .predicates
-            .0
-            .iter()
-            .map(|proposition| builder.make_variable(&format!("{proposition}")))
-            .collect();
-        (variables, builder.build())
-    }
+    // fn bdd_variables(&self) -> (Vec<BddVariable>, BddVariableSet) {
+    //     let mut builder = BddVariableSetBuilder::new();
+    //     let variables = self
+    //         .predicates
+    //         .0
+    //         .iter()
+    //         .map(|proposition| builder.make_variable(&format!("{proposition}")))
+    //         .collect();
+    //     (variables, builder.build())
+    // }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -286,10 +324,7 @@ impl<D: Domain> PropertyBuilder<D> {
     fn is_in_nnf(&self, property: PropertyId) -> bool {
         match self.properties[property.0] {
             PropertyAst::Atomic(_) => true,
-            PropertyAst::Not(subf) => match self.properties[subf.0] {
-                PropertyAst::Atomic(_) => true,
-                _ => false,
-            },
+            PropertyAst::Not(subf) => matches!(self.properties[subf.0], PropertyAst::Atomic(_)),
             PropertyAst::And(lhs, rhs) | PropertyAst::Or(lhs, rhs) => {
                 self.is_in_nnf(lhs) && self.is_in_nnf(rhs)
             }
@@ -376,10 +411,11 @@ impl<D: Domain> PropertyBuilder<D> {
 impl<D: Domain> PropertyBuilder<D> {
     fn to_alternating_büchi(&self, property: PropertyId) -> AlternatingBüchiAutomaton {
         assert!(self.is_in_nnf(property));
-        let (variables, set) = self.bdd_variables();
-        let mut automaton = AlternatingBüchiAutomaton::new_büchi(&set);
+        let variables = &self.predicates.variables;
+        let set = &self.predicates.manager;
+        let mut automaton = AlternatingBüchiAutomaton::new_büchi(set);
         let initial_state =
-            self.to_alternating_büchi_state(&variables, &set, &mut automaton, property);
+            self.to_alternating_büchi_state(variables, set, &mut automaton, property);
         automaton.set_initial(initial_state);
         automaton
     }
@@ -456,20 +492,20 @@ impl<D: Domain> PropertyBuilder<D> {
         set: &BddVariableSet,
         automaton: &mut AlternatingBüchiAutomaton,
         property: PropertyId,
-    ) -> AlternatingEdges {
+    ) -> Vec<(Bdd, HashSet<StateId>)> {
         match self.properties[property.0] {
             PropertyAst::Atomic(prop) => {
-                return vec![(
+                vec![(
                     set.mk_literal(variables[prop.0], true),
                     hashset! {automaton.accepting_sink()},
-                )];
+                )]
             }
             PropertyAst::Not(subf) => match self.properties[subf.0] {
                 PropertyAst::Atomic(prop) => {
-                    return vec![(
+                    vec![(
                         set.mk_literal(variables[prop.0], false),
                         hashset! {automaton.accepting_sink()},
-                    )];
+                    )]
                 }
                 _ => unreachable!("formula is in negation normal form"),
             },
@@ -478,13 +514,13 @@ impl<D: Domain> PropertyBuilder<D> {
                 let mut lhs = self.to_alternating_büchi_edge(variables, set, automaton, lhs);
                 let mut rhs = self.to_alternating_büchi_edge(variables, set, automaton, rhs);
                 lhs.append(&mut rhs);
-                return lhs;
+                lhs
             }
             PropertyAst::Always(_) => todo!(),
             PropertyAst::Finally(_) => todo!(),
             PropertyAst::Next(subf) => {
                 let state = self.to_alternating_büchi_state(variables, set, automaton, subf);
-                return vec![(set.mk_true(), hashset! {state})];
+                vec![(set.mk_true(), hashset! {state})]
             }
         }
     }
@@ -495,25 +531,34 @@ mod tests {
     use super::*;
     use crate::automaton::{NonDeterministicBüchiAutomaton, NonDeterministicSafetyAutomaton};
 
-    #[test]
-    fn simple() {
-        #[derive(Debug, PartialEq, Eq)]
-        enum Observation {
-            A,
-            B,
-        }
+    #[derive(Debug, PartialEq, Eq)]
+    pub(crate) enum TestObs {
+        A,
+        B,
+    }
 
-        impl Domain for Observation {}
+    impl Domain for TestObs {}
 
-        let mut builder = PropertyBuilder2::new();
+    pub(crate) fn predicates() -> Predicates<TestObs> {
+        let mut builder = Predicates::builder();
         let eq_a = builder.new_predicate(ClosurePredicate {
             name: "obs is equal to A",
-            closure: Box::new(|p: Observation| p == Observation::A),
+            closure: Box::new(|p: &TestObs| *p == TestObs::A),
         });
         let eq_b = builder.new_predicate(ClosurePredicate {
             name: "obs is equal to B",
-            closure: Box::new(|p| p == Observation::B),
+            closure: Box::new(|p| *p == TestObs::B),
         });
+        builder.build()
+    }
+
+    #[test]
+    fn simple() {
+        let predicates = predicates();
+        let eq_a = PredicateId(0);
+        let eq_b = PredicateId(1);
+
+        let mut builder = PropertyBuilder2::new(predicates);
 
         let prop = Property::always(
             &builder
