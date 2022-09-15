@@ -3,7 +3,11 @@ name = "telo"
 version = "0.1.0"
 edition = "2021"
 description = "Temporal specifications in Rust"
-license = "MIT"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ltentrup/telo"
+readme = "README.md"
+keywords = ["temporal", "logic"]
+categories = ["development-tools::testing"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -13,3 +17,4 @@ bitvec = "1.0"
 dot = "0.1"
 itertools = "0.10"
 maplit = "1.0"
+thiserror = "1.0"

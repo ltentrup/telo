@@ -3,17 +3,33 @@
 use biodivine_lib_bdd::{Bdd, BddValuation, BddVariableSet};
 use bitvec::vec::BitVec;
 use itertools::Itertools;
-use maplit::{hashmap, hashset};
+use maplit::hashmap;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fmt::Debug,
 };
+use thiserror::Error;
 
 mod dot;
 
+#[derive(Error, Debug)]
+pub enum Error {
+    #[error("missing initial state, call `set_initial` before `build`")]
+    MissingInitialState,
+}
+
 #[derive(Clone)]
-pub(crate) struct Automaton<Edg, Acc> {
+pub struct Automaton<Edg, Acc> {
     initial_state: StateId,
+    states: Vec<State>,
+    transitions: Vec<Edg>,
+    acceptance: Acc,
+    variables: BddVariableSet,
+}
+
+#[derive(Clone)]
+pub struct AutomatonBuilder<Edg, Acc> {
+    initial_state: Option<StateId>,
     states: Vec<State>,
     transitions: Vec<Edg>,
     acceptance: Acc,
@@ -27,23 +43,23 @@ pub(crate) struct Alternating(Vec<(Bdd, HashSet<StateId>)>);
 pub(crate) struct NonDeterministic(HashMap<StateId, Bdd>);
 
 #[derive(Debug, Clone, Default)]
-pub(crate) struct Deterministic(HashMap<StateId, Bdd>);
+pub struct Deterministic(HashMap<StateId, Bdd>);
 
 /// Runs that visit the provided states infinitely often are accepting.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct Büchi(Vec<StateId>);
 
 /// All runs of an automaton are accepting.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct Safety(());
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Safety(());
 
 pub(crate) type AlternatingBüchiAutomaton = Automaton<Alternating, Büchi>;
 pub(crate) type NonDeterministicBüchiAutomaton = Automaton<NonDeterministic, Büchi>;
 pub(crate) type NonDeterministicSafetyAutomaton = Automaton<NonDeterministic, Safety>;
-pub(crate) type DeterministicSafetyAutomaton = Automaton<Deterministic, Safety>;
+pub type DeterministicSafetyAutomaton = Automaton<Deterministic, Safety>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct StateId(usize);
+pub struct StateId(usize);
 
 #[derive(Debug, Clone)]
 struct State {
@@ -51,8 +67,25 @@ struct State {
     name: Option<String>,
 }
 
-impl<Edg: Default, Acc> Automaton<Edg, Acc> {
-    pub(crate) fn new_state(&mut self, name: Option<&str>) -> StateId {
+impl<Edg, Acc: Default> Automaton<Edg, Acc> {
+    pub fn builder(variables: &BddVariableSet) -> AutomatonBuilder<Edg, Acc> {
+        AutomatonBuilder {
+            initial_state: None,
+            states: Vec::new(),
+            transitions: Vec::new(),
+            acceptance: Acc::default(),
+            variables: variables.clone(),
+        }
+    }
+}
+
+impl<Edg: Clone + Default, Acc: Clone> AutomatonBuilder<Edg, Acc> {
+    pub fn set_initial(&mut self, state: StateId) -> &mut Self {
+        self.initial_state = Some(state);
+        self
+    }
+
+    pub fn new_state(&mut self, name: Option<&str>) -> StateId {
         let id = StateId(self.states.len());
         self.states.push(State {
             id,
@@ -64,8 +97,20 @@ impl<Edg: Default, Acc> Automaton<Edg, Acc> {
         id
     }
 
-    pub(crate) fn set_initial(&mut self, state: StateId) {
-        self.initial_state = state;
+    pub fn build(&self) -> Result<Automaton<Edg, Acc>, Error> {
+        Ok(Automaton {
+            initial_state: self.initial_state.ok_or(Error::MissingInitialState)?,
+            states: self.states.clone(),
+            transitions: self.transitions.clone(),
+            acceptance: self.acceptance.clone(),
+            variables: self.variables.clone(),
+        })
+    }
+}
+
+impl<Edg, Acc> Automaton<Edg, Acc> {
+    pub(crate) fn state_count(&self) -> usize {
+        self.states.len()
     }
 
     pub(crate) fn get_initial(&self) -> StateId {
@@ -73,44 +118,51 @@ impl<Edg: Default, Acc> Automaton<Edg, Acc> {
     }
 }
 
-impl<Acc> Automaton<NonDeterministic, Acc> {
-    pub(crate) fn add_edge(&mut self, state: StateId, guard: Bdd, target: StateId) {
+impl<Acc> AutomatonBuilder<NonDeterministic, Acc> {
+    pub(crate) fn add_edge(&mut self, state: StateId, guard: &Bdd, target: StateId) -> &mut Self {
         if guard.is_false() {
-            return;
+            return self;
         }
         let entry = self.transitions[state.0]
             .0
             .entry(target)
             .or_insert_with(|| self.variables.mk_false());
-        *entry = entry.or(&guard);
+        *entry = entry.or(guard);
+        self
     }
 }
 
-impl<Acc> Automaton<Alternating, Acc> {
-    pub(crate) fn add_edge(&mut self, state: StateId, guard: Bdd, target: HashSet<StateId>) {
+impl<Acc> AutomatonBuilder<Alternating, Acc> {
+    pub(crate) fn add_edge(
+        &mut self,
+        state: StateId,
+        guard: Bdd,
+        target: HashSet<StateId>,
+    ) -> &mut Self {
         if guard.is_false() {
-            return;
+            return self;
         }
         // check if there is an existing edge with the same target
         for (other_guard, other_target) in &mut self.transitions[state.0].0 {
             if target == *other_target {
                 *other_guard = other_guard.or(&guard);
-                return;
+                return self;
             }
         }
         self.transitions[state.0].0.push((guard, target));
+        self
     }
 }
 
-impl<Acc> Automaton<Deterministic, Acc> {
-    pub(crate) fn add_edge(&mut self, state: StateId, guard: Bdd, target: StateId) {
+impl<Acc> AutomatonBuilder<Deterministic, Acc> {
+    pub(crate) fn add_edge(&mut self, state: StateId, guard: &Bdd, target: StateId) -> &mut Self {
         if guard.is_false() {
-            return;
+            return self;
         }
         // check that transition guards are non-overlapping
         for (other_target, other_guard) in &self.transitions[state.0].0 {
-            if target == *other_target && guard == *other_guard {
-                return;
+            if target == *other_target && guard == other_guard {
+                return self;
             }
             assert!(
                 guard.and(other_guard).is_false(),
@@ -122,9 +174,12 @@ impl<Acc> Automaton<Deterministic, Acc> {
             .0
             .entry(target)
             .or_insert_with(|| self.variables.mk_false());
-        *entry = entry.or(&guard);
+        *entry = entry.or(guard);
+        self
     }
+}
 
+impl<Acc> Automaton<Deterministic, Acc> {
     pub(crate) fn next_state(&self, state: StateId, valuation: &BddValuation) -> Option<StateId> {
         self.transitions[state.0]
             .0
@@ -134,48 +189,9 @@ impl<Acc> Automaton<Deterministic, Acc> {
     }
 }
 
-impl<Edg> Automaton<Edg, Büchi> {
+impl<Edg> AutomatonBuilder<Edg, Büchi> {
     pub(crate) fn add_accepting(&mut self, state: StateId) {
         self.acceptance.0.push(state);
-    }
-}
-
-impl AlternatingBüchiAutomaton {
-    pub(crate) fn new_büchi(variables: &BddVariableSet) -> Self {
-        Self {
-            initial_state: StateId(0),
-            states: vec![State {
-                id: StateId(0),
-                name: Some("true".to_string()),
-            }],
-            transitions: vec![Alternating(vec![(
-                variables.mk_true(),
-                hashset! {StateId(0)},
-            )])],
-            acceptance: Büchi(vec![StateId(0)]),
-            variables: variables.clone(),
-        }
-    }
-
-    pub(crate) fn accepting_sink(&self) -> StateId {
-        StateId(0)
-    }
-}
-
-impl NonDeterministicBüchiAutomaton {
-    fn new_büchi(variables: &BddVariableSet) -> Self {
-        Self {
-            initial_state: StateId(0),
-            states: vec![State {
-                id: StateId(0),
-                name: Some("true".to_string()),
-            }],
-            transitions: vec![NonDeterministic(
-                hashmap! {StateId(0) => variables.mk_true()},
-            )],
-            acceptance: Büchi(vec![StateId(0)]),
-            variables: variables.clone(),
-        }
     }
 }
 
@@ -186,7 +202,7 @@ impl NonDeterministicBüchiAutomaton {
     /// The conversion is implemented using the Miyano-Hayashi construction.
     pub(crate) fn from(alternating: &AlternatingBüchiAutomaton) -> Self {
         let variables = &alternating.variables;
-        let mut automaton = NonDeterministicBüchiAutomaton::new_büchi(variables);
+        let mut automaton = NonDeterministicBüchiAutomaton::builder(variables);
         let initial_state = (
             PowerState::singleton(alternating, alternating.initial_state),
             PowerState::empty(alternating),
@@ -201,8 +217,6 @@ impl NonDeterministicBüchiAutomaton {
         let mut queue = VecDeque::from([initial_state]);
 
         while let Some(state) = queue.pop_front() {
-            let formatted = format_state(&state);
-            println!("{:?}", formatted);
             for (guard, (left, right)) in state
                 .0
                 .iter()
@@ -241,7 +255,6 @@ impl NonDeterministicBüchiAutomaton {
                 };
                 let target_states = (left, accepting_states);
                 let formatted = format_state(&target_states);
-                println!("  {} -> {formatted}", format_bdd(&guard, variables));
                 let target = *mapping.entry(target_states.clone()).or_insert_with(|| {
                     let id = automaton.new_state(Some(&formatted));
                     if target_states.1.is_empty() {
@@ -250,11 +263,13 @@ impl NonDeterministicBüchiAutomaton {
                     queue.push_back(target_states);
                     id
                 });
-                automaton.add_edge(mapping[&state], guard.clone(), target);
+                automaton.add_edge(mapping[&state], &guard, target);
             }
         }
 
         automaton
+            .build()
+            .expect("automaton construction should not fail")
     }
 }
 
@@ -268,18 +283,14 @@ fn format_bdd(bdd: &Bdd, variables: &BddVariableSet) -> String {
     } else if bdd.is_false() {
         return "false".to_string();
     }
-    let mut dnf = bdd
+    let dnf = bdd
         .sat_clauses()
         .map(|clause| {
             clause
                 .to_values()
                 .into_iter()
                 .map(|(var, val)| {
-                    format!(
-                        "{}({})",
-                        if !val { "!" } else { "" },
-                        variables.name_of(var)
-                    )
+                    format!("{}({})", if val { "" } else { "!" }, variables.name_of(var))
                 })
                 .collect::<Vec<_>>()
                 .join(" & ")
@@ -356,38 +367,7 @@ impl std::fmt::Display for PowerState {
     }
 }
 
-impl<Edg: Default> Automaton<Edg, Safety> {
-    fn new_with_state(variables: &BddVariableSet, state: Option<&str>) -> Self {
-        Self {
-            initial_state: StateId(0),
-            states: vec![State {
-                id: StateId(0),
-                name: state.map(|name| name.to_string()),
-            }],
-            transitions: vec![Edg::default()],
-            acceptance: Safety(()),
-            variables: variables.clone(),
-        }
-    }
-}
-
 impl NonDeterministicSafetyAutomaton {
-    /// Returns an automaton that accepts all inputs.
-    fn new(variables: &BddVariableSet) -> Self {
-        Self {
-            initial_state: StateId(0),
-            states: vec![State {
-                id: StateId(0),
-                name: Some("true".to_string()),
-            }],
-            transitions: vec![NonDeterministic(
-                hashmap! {StateId(0) => variables.mk_true()},
-            )],
-            acceptance: Safety(()),
-            variables: variables.clone(),
-        }
-    }
-
     /// Interpret a Büchi automaton as a safety automaton, thus, ignoring
     /// the Büchi acceptance condition. All runs in the resulting automaton
     /// are accepting.
@@ -404,7 +384,7 @@ impl NonDeterministicSafetyAutomaton {
     /// Checks whether the automaton is deterministic, i.e., for every state
     /// and every pair of outgoing transition of this state, the transition
     /// guards are non-overlapping.
-    pub(crate) fn is_deterministic(&self) -> bool {
+    pub fn is_deterministic(&self) -> bool {
         self.states.iter().all(|state| {
             self.transitions[state.id.0]
                 .0
@@ -421,15 +401,15 @@ impl NonDeterministicSafetyAutomaton {
     pub(crate) fn determinize(&self) -> DeterministicSafetyAutomaton {
         let initial_state = PowerState::singleton(self, self.initial_state);
         let formatted = format!("{initial_state}");
-        let mut automaton =
-            DeterministicSafetyAutomaton::new_with_state(&self.variables, Some(&formatted));
-        let initial_state_id = automaton.initial_state;
+        let mut automaton = DeterministicSafetyAutomaton::builder(&self.variables);
+        // DeterministicSafetyAutomaton::new_with_state(&self.variables, );
+        let initial_state_id = automaton.new_state(Some(&formatted));
+        automaton.set_initial(initial_state_id);
         let mut mapping = hashmap! {initial_state.clone() => initial_state_id};
 
         let mut queue = VecDeque::from([initial_state]);
 
         while let Some(state) = queue.pop_front() {
-            println!("{state}");
             // collect all possible transitions
             let transitions: Vec<_> = state
                 .iter()
@@ -444,11 +424,6 @@ impl NonDeterministicSafetyAutomaton {
                 let (guard, targets) = transitions.iter().enumerate().fold(
                     (automaton.variables.mk_true(), Vec::new()),
                     |(val_guard, mut val_target), (idx, (guard, target))| {
-                        // println!(
-                        //     "xxx {idx} {} {}",
-                        //     format_bdd(&val_guard, &automaton.variables),
-                        //     format_bdd(&guard, &automaton.variables)
-                        // );
                         if x.contains(&idx) {
                             val_target.push(*target);
                             (val_guard.and(guard), val_target)
@@ -460,11 +435,6 @@ impl NonDeterministicSafetyAutomaton {
                 if guard.is_false() {
                     continue;
                 }
-                println!(
-                    "   -> {} {:?}",
-                    format_bdd(&guard, &automaton.variables),
-                    targets
-                );
                 let targets = PowerState::from(self, &targets);
                 let formatted = format!("{targets}");
                 let target = *mapping.entry(targets.clone()).or_insert_with(|| {
@@ -472,14 +442,15 @@ impl NonDeterministicSafetyAutomaton {
                     queue.push_back(targets);
                     id
                 });
-                automaton.add_edge(mapping[&state], guard.clone(), target);
+                automaton.add_edge(mapping[&state], &guard, target);
             }
         }
-        automaton
+        automaton.build().expect("determinization should not fail")
     }
 }
 
 impl DeterministicSafetyAutomaton {
+    #[cfg(test)]
     pub(crate) fn new_invariant(variables: BddVariableSet, invariant: Bdd) -> Self {
         Self {
             initial_state: StateId(0),
@@ -495,6 +466,39 @@ impl DeterministicSafetyAutomaton {
 
     /// Minimizes the number of states of a deterministic automaton.
     pub(crate) fn minimize(&self) -> Self {
+        let equivalence_classes = self.determine_equivalence_classes();
+
+        // build the automaton from the equivalence classes
+        let initial_state = equivalence_classes
+            .iter()
+            .find(|class| class.contains(self.initial_state))
+            .expect("every state is in exactly one equivalence class");
+        let mut automaton = Self::builder(&self.variables);
+        let initial_state_id = automaton.new_state(Some(&format!("{initial_state}")));
+        automaton.set_initial(initial_state_id);
+        let mut mapping = hashmap! {initial_state.clone() => initial_state_id};
+
+        for class in &equivalence_classes {
+            let state_id = *mapping
+                .entry(class.clone())
+                .or_insert_with(|| automaton.new_state(Some(&format!("{class}"))));
+            for state in class.iter() {
+                for (target, guard) in &self.transitions[state.0].0 {
+                    let target_class = equivalence_classes
+                        .iter()
+                        .find(|class| class.contains(*target))
+                        .expect("every state is in exactly one equivalence class");
+                    let target_state_id = *mapping
+                        .entry(target_class.clone())
+                        .or_insert_with(|| automaton.new_state(Some(&format!("{target_class}"))));
+                    automaton.add_edge(state_id, guard, target_state_id);
+                }
+            }
+        }
+        automaton.build().expect("minimization should not fail")
+    }
+
+    fn determine_equivalence_classes(&self) -> Vec<PowerState> {
         // initially, all states start in the same equivalence class
         let mut equivalence_classes = vec![PowerState::all(self)];
         let mut new_equivalence_classes = Vec::new();
@@ -536,10 +540,8 @@ impl DeterministicSafetyAutomaton {
                         different = true;
                     }
                     if different {
-                        println!("different {:?} {:?}", pivot, other);
                         other_equiv.add(other);
                     } else {
-                        println!("same {:?} {:?}", pivot, other);
                         new_equiv.add(other);
                     }
                 }
@@ -552,41 +554,41 @@ impl DeterministicSafetyAutomaton {
 
             if equivalence_classes.len() == new_equivalence_classes.len() {
                 break;
-            } else {
-                equivalence_classes = std::mem::take(&mut new_equivalence_classes);
             }
+            equivalence_classes = std::mem::take(&mut new_equivalence_classes);
         }
+        equivalence_classes
+    }
 
-        // build the automaton from the equivalence classes
-        let initial_state = equivalence_classes
-            .iter()
-            .find(|class| class.contains(self.initial_state))
-            .expect("every state is in exactly one equivalence class");
-        let mut automaton =
-            Self::new_with_state(&self.variables, Some(&format!("{initial_state}")));
-        let initial_state_id = automaton.initial_state;
-        let mut mapping = hashmap! {initial_state.clone() => initial_state_id};
-
-        for class in &equivalence_classes {
-            println!("{class}");
-            let state_id = *mapping
-                .entry(class.clone())
-                .or_insert_with(|| automaton.new_state(Some(&format!("{class}"))));
-            for state in class.iter() {
-                dbg!(&state);
-                for (target, guard) in &self.transitions[state.0].0 {
-                    let target_class = equivalence_classes
+    fn concat(&self, other: &Self) -> Self {
+        let mut result = self.clone();
+        result.states.extend(other.states.iter().map(|s| State {
+            id: StateId(s.id.0 + self.state_count()),
+            name: s.name.clone(),
+        }));
+        result
+            .transitions
+            .extend(other.transitions.iter().map(|edge| {
+                Deterministic(
+                    edge.0
                         .iter()
-                        .find(|class| class.contains(*target))
-                        .expect("every state is in exactly one equivalence class");
-                    let target_state_id = *mapping
-                        .entry(target_class.clone())
-                        .or_insert_with(|| automaton.new_state(Some(&format!("{target_class}"))));
-                    automaton.add_edge(state_id, guard.clone(), target_state_id);
-                }
-            }
-        }
-        automaton
+                        .map(|(target, guard)| {
+                            (StateId(target.0 + self.state_count()), guard.clone())
+                        })
+                        .collect(),
+                )
+            }));
+        result
+    }
+
+    pub fn is_equivalent_to(&self, other: &Self) -> bool {
+        let combined = self.concat(other);
+        let left_initial = self.initial_state;
+        let right_initial = StateId(other.initial_state.0 + self.state_count());
+        let equivalences = combined.determine_equivalence_classes();
+        equivalences.iter().any(|powerstate| {
+            powerstate.contains(left_initial) && powerstate.contains(right_initial)
+        })
     }
 }
 
@@ -621,5 +623,30 @@ impl std::ops::Index<&StateId> for NonDeterministic {
 
     fn index(&self, index: &StateId) -> &Self::Output {
         &self.0[index]
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::DeterministicSafetyAutomaton;
+    use biodivine_lib_bdd::{BddVariableSet, BddVariableSetBuilder};
+
+    #[test]
+    fn same_is_equivalent() {
+        let mut builder = BddVariableSetBuilder::new();
+        let [a, b] = builder.make(&["a", "b"]);
+        let variables: BddVariableSet = builder.build();
+        let invariant = variables
+            .mk_literal(a, true)
+            .and(&variables.mk_literal(b, false));
+        let automaton = DeterministicSafetyAutomaton::new_invariant(variables.clone(), invariant);
+        let copy = automaton.clone();
+        assert!(automaton.is_equivalent_to(&copy));
+
+        let invariant = variables
+            .mk_literal(a, true)
+            .and(&variables.mk_literal(b, true));
+        let automaton2 = DeterministicSafetyAutomaton::new_invariant(variables, invariant);
+        assert!(!automaton.is_equivalent_to(&automaton2));
     }
 }

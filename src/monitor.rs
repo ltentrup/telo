@@ -3,14 +3,15 @@ use crate::{
     Domain, Predicates,
 };
 
-struct Monitor<D: Domain> {
+pub struct Monitor<D: Domain> {
     predicates: Predicates<D>,
     automaton: DeterministicSafetyAutomaton,
     state: StateId,
 }
 
 impl<D: Domain> Monitor<D> {
-    fn new(predicates: Predicates<D>, automaton: DeterministicSafetyAutomaton) -> Self {
+    #[must_use]
+    pub fn new(predicates: Predicates<D>, automaton: DeterministicSafetyAutomaton) -> Self {
         let initial_state = automaton.get_initial();
         Self {
             predicates,
@@ -19,7 +20,7 @@ impl<D: Domain> Monitor<D> {
         }
     }
 
-    fn next_state(&mut self, observation: &D) -> bool {
+    pub fn next_state(&mut self, observation: &D) -> bool {
         let valuation = self.predicates.evaluate(observation);
         match self.automaton.next_state(self.state, &valuation) {
             Some(state) => {
@@ -34,15 +35,15 @@ impl<D: Domain> Monitor<D> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::{tests::TestObs, ClosurePredicate, PredicateId, Predicates};
+    use crate::{tests::TestObs, PredicateId};
 
     #[test]
     fn invariant() {
         let predicates = crate::tests::predicates();
-        let eq_a = PredicateId(0);
+        let eq_a = PredicateId::new_unchecked(0);
 
         let var = predicates.bdd_variable(eq_a);
-        let bdd = predicates.bdd_manager().mk_literal(*var, true);
+        let bdd = predicates.bdd_manager().mk_literal(var, true);
 
         let automaton =
             DeterministicSafetyAutomaton::new_invariant(predicates.bdd_manager().clone(), bdd);

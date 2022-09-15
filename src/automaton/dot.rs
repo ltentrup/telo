@@ -24,7 +24,6 @@ impl<Edg> StateStyle for Automaton<Edg, Büchi> {
 
 impl<Edg> StateStyle for Automaton<Edg, Safety> {}
 
-#[allow(clippy::redundant_pub_crate)]
 #[derive(Debug, Clone)]
 pub(crate) enum DrawNode {
     Initial,
@@ -33,7 +32,6 @@ pub(crate) enum DrawNode {
     AndNode(StateId, HashSet<StateId>),
 }
 
-#[allow(clippy::redundant_pub_crate)]
 #[derive(Debug, Clone)]
 pub(crate) enum DrawEdge {
     ToInitial,
