@@ -42,6 +42,18 @@ impl<D: Domain> std::fmt::Display for ClosurePredicate<D> {
     }
 }
 
+impl<D: Domain> ClosurePredicate<D> {
+    pub fn new<F>(closure: F, name: &'static str) -> Self
+    where
+        F: Fn(&D) -> bool + 'static,
+    {
+        Self {
+            name,
+            closure: Box::new(closure),
+        }
+    }
+}
+
 pub struct PredicatesBuilder<D: Domain>(Vec<ClosurePredicate<D>>);
 
 pub struct Predicates<D: Domain> {

@@ -1,11 +1,4 @@
-//! # Temporal Specifications in Rust
-//!
-//! Translation steps:
-//! * Safety LTL over arbitrary domain
-//! * Negation No&rmal Form
-//! * Alternating-time safety automaton
-//! * Deterministic safety automaton
-
+#![doc = include_str!("../README.md")]
 #![deny(clippy::all)]
 #![warn(clippy::pedantic, clippy::cargo)]
 #![allow(clippy::module_name_repetitions)]
@@ -27,6 +20,8 @@ use std::collections::HashSet;
 use crate::automaton::{NonDeterministicBüchiAutomaton, NonDeterministicSafetyAutomaton};
 
 pub trait Domain: 'static {}
+
+impl<T: 'static> Domain for T {}
 
 #[derive(Debug, Clone)]
 pub enum Property {
@@ -373,8 +368,6 @@ mod tests {
         A,
         B,
     }
-
-    impl Domain for TestObs {}
 
     pub(crate) fn predicates() -> Predicates<TestObs> {
         let mut builder = Predicates::builder();
