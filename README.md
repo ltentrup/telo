@@ -22,10 +22,10 @@ let predicates = builder.build();
 // Step 2: define temporal specification
 let property = Property::never(Property::atomic(above_limit));
 
-// Step 3: monitoring automaton
+// Step 3: transform to monitoring automaton
 let automaton = property.to_monitoring_automaton(&predicates);
 
-// Step 4: Runtime monitoring
+// Step 4: runtime monitoring
 let mut monitor = Monitor::new(predicates, automaton);
 for value in 0..LIMIT {
   assert!(monitor.next_state(&value));
