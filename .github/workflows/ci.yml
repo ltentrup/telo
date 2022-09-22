@@ -1,18 +1,24 @@
-on: [push, pull_request]
-
 name: Continuous integration
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+env:
+  RUST_BACKTRACE: 1
+  CARGO_TERM_COLOR: always
 
 jobs:
   fmt:
     name: Rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
       - uses: actions-rs/toolchain@v1
         with:
-          profile: minimal
-          toolchain: stable
-          override: true
+            toolchain: stable
       - run: rustup component add rustfmt
       - uses: actions-rs/cargo@v1
         with:
@@ -23,12 +29,10 @@ jobs:
     name: Clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
       - uses: actions-rs/toolchain@v1
         with:
-          profile: minimal
-          toolchain: stable
-          override: true
+            toolchain: stable
       - run: rustup component add clippy
       - uses: actions-rs/cargo@v1
         with:
@@ -39,12 +43,16 @@ jobs:
     name: Test Suite
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
       - uses: actions-rs/toolchain@v1
         with:
-          profile: minimal
-          toolchain: stable
-          override: true
-      - uses: actions-rs/cargo@v1
+            toolchain: stable
+      - name: compile
+        uses: actions-rs/cargo@v1
+        with:
+          command: test
+          args: --no-run
+      - name: test
+        uses: actions-rs/cargo@v1
         with:
           command: test

@@ -597,7 +597,7 @@ impl<'a> IntoIterator for &'a Deterministic {
     type IntoIter = std::collections::hash_map::Iter<'a, StateId, Bdd>;
 
     fn into_iter(self) -> Self::IntoIter {
-        (&self.0).iter()
+        self.0.iter()
     }
 }
 
@@ -606,7 +606,7 @@ impl<'a> IntoIterator for &'a NonDeterministic {
     type IntoIter = std::collections::hash_map::Iter<'a, StateId, Bdd>;
 
     fn into_iter(self) -> Self::IntoIter {
-        (&self.0).iter()
+        self.0.iter()
     }
 }
 
