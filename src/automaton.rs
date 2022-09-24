@@ -516,8 +516,6 @@ impl DeterministicSafetyAutomaton {
                     let mut different = false;
                     let mut rejecting = self.variables.mk_true();
                     let mut other_rejecting = self.variables.mk_true();
-                    assert!(!self.transitions[pivot.0].0.is_empty());
-                    assert!(!self.transitions[other.0].0.is_empty());
                     for ((target, guard), (other_target, other_guard)) in self.transitions[pivot.0]
                         .0
                         .iter()
@@ -536,7 +534,12 @@ impl DeterministicSafetyAutomaton {
                             different = true;
                         }
                     }
-                    if rejecting != other_rejecting {
+                    let one_has_no_transitions = self.transitions[pivot.0].0.is_empty()
+                        ^ self.transitions[other.0].0.is_empty();
+                    // If one state has no transitions, it holds that
+                    // `rejecting == other_rejecting` as the loop above is not
+                    // run. The states cannot be in the same equivalence class, though.
+                    if one_has_no_transitions || rejecting != other_rejecting {
                         different = true;
                     }
                     if different {
