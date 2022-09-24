@@ -23,7 +23,7 @@ pub trait Domain: 'static {}
 
 impl<T: 'static> Domain for T {}
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Property {
     // boolean
     True,
@@ -36,6 +36,8 @@ pub enum Property {
     Always(Box<Self>),
     Finally(Box<Self>),
     Next(Box<Self>),
+    Until(Box<Self>, Box<Self>),
+    Release(Box<Self>, Box<Self>),
 }
 
 impl std::ops::BitAnd for Property {
@@ -96,6 +98,16 @@ impl Property {
         Self::Finally(property.into())
     }
 
+    #[must_use]
+    pub fn until(self, rhs: Self) -> Self {
+        Self::Until(self.into(), rhs.into())
+    }
+
+    #[must_use]
+    pub fn release(self, rhs: Self) -> Self {
+        Self::Release(self.into(), rhs.into())
+    }
+
     /// Translates the temporal property into a deterministic safety automaton
     /// that is suitable for runtime verification, i.e., monitoring.
     #[must_use]
@@ -118,7 +130,10 @@ impl Property {
         match self {
             Self::True | Self::Atomic(_) => true,
             Self::Not(subf) => matches!(subf.as_ref(), Self::True | Self::Atomic(_)),
-            Self::And(lhs, rhs) | Self::Or(lhs, rhs) => lhs.is_in_nnf() && rhs.is_in_nnf(),
+            Self::And(lhs, rhs)
+            | Self::Or(lhs, rhs)
+            | Self::Until(lhs, rhs)
+            | Self::Release(lhs, rhs) => lhs.is_in_nnf() && rhs.is_in_nnf(),
             Self::Always(subf) | Self::Finally(subf) | Self::Next(subf) => subf.is_in_nnf(),
         }
     }
@@ -186,6 +201,24 @@ impl Property {
                 let subf = subf.to_nnf_core(negated);
                 Self::Next(subf.into())
             }
+            Self::Until(lhs, rhs) => {
+                let lhs = lhs.to_nnf_core(negated);
+                let rhs = rhs.to_nnf_core(negated);
+                if negated {
+                    Self::Release(lhs.into(), rhs.into())
+                } else {
+                    Self::Until(lhs.into(), rhs.into())
+                }
+            }
+            Self::Release(lhs, rhs) => {
+                let lhs = lhs.to_nnf_core(negated);
+                let rhs = rhs.to_nnf_core(negated);
+                if negated {
+                    Self::Until(lhs.into(), rhs.into())
+                } else {
+                    Self::Release(lhs.into(), rhs.into())
+                }
+            }
         }
     }
 
@@ -203,6 +236,12 @@ impl Property {
             Self::Always(subf) => format!("G {}", subf.format(predicates)),
             Self::Finally(subf) => format!("F {}", subf.format(predicates)),
             Self::Next(subf) => format!("X {}", subf.format(predicates)),
+            Self::Until(lhs, rhs) => {
+                format!("({} U {})", lhs.format(predicates), rhs.format(predicates))
+            }
+            Self::Release(lhs, rhs) => {
+                format!("({} R {})", lhs.format(predicates), rhs.format(predicates))
+            }
         }
     }
 
@@ -300,6 +339,37 @@ impl Property {
                     subf.to_alternating_büchi_state(predicates, automaton, accepting_sink);
                 automaton.add_edge(state, set.mk_true(), hashset! {next_state});
             }
+            Self::Until(lhs, rhs) => {
+                let lhs = lhs.to_alternating_büchi_edge(predicates, automaton, accepting_sink);
+                let rhs = rhs.to_alternating_büchi_edge(predicates, automaton, accepting_sink);
+                for (guard, target) in rhs {
+                    automaton.add_edge(state, guard, target);
+                }
+                for (guard, mut target) in lhs {
+                    // since the constraint is conjunctive, we can remove edges to the accepting sink
+                    target.retain(|&s| s != accepting_sink);
+                    target.insert(state);
+                    automaton.add_edge(state, guard, target);
+                }
+            }
+            Self::Release(lhs, rhs) => {
+                let lhs = lhs.to_alternating_büchi_edge(predicates, automaton, accepting_sink);
+                let rhs = rhs.to_alternating_büchi_edge(predicates, automaton, accepting_sink);
+                for ((left_guard, left_target), (right_guard, right_target)) in
+                    lhs.iter().cartesian_product(&rhs)
+                {
+                    let guard = left_guard.and(right_guard);
+                    let target = left_target.iter().chain(right_target).copied().collect();
+                    automaton.add_edge(state, guard, target);
+                }
+                for (guard, mut target) in rhs {
+                    // since the constraint is conjunctive, we can remove edges to the accepting sink
+                    target.retain(|&s| s != accepting_sink);
+                    target.insert(state);
+                    automaton.add_edge(state, guard, target);
+                }
+                automaton.add_accepting(state);
+            }
         }
 
         state
@@ -378,6 +448,35 @@ impl Property {
             Self::Next(subf) => {
                 let state = subf.to_alternating_büchi_state(predicates, automaton, accepting_sink);
                 vec![(predicates.bdd_manager().mk_true(), hashset! {state})]
+            }
+            Property::Until(lhs, rhs) => {
+                let state = self.to_alternating_büchi_state(predicates, automaton, accepting_sink);
+                let lhs = lhs.to_alternating_büchi_edge(predicates, automaton, accepting_sink);
+                let mut rhs = rhs.to_alternating_büchi_edge(predicates, automaton, accepting_sink);
+                rhs.extend(lhs.into_iter().map(|(guard, mut target)| {
+                    target.insert(state);
+                    (guard, target)
+                }));
+                rhs
+            }
+            Property::Release(lhs, rhs) => {
+                let state = self.to_alternating_büchi_state(predicates, automaton, accepting_sink);
+                let lhs = lhs.to_alternating_büchi_edge(predicates, automaton, accepting_sink);
+                let rhs = rhs.to_alternating_büchi_edge(predicates, automaton, accepting_sink);
+                rhs.iter()
+                    .cloned()
+                    .map(|(guard, mut target)| {
+                        target.insert(state);
+                        (guard, target)
+                    })
+                    .chain(lhs.iter().cartesian_product(&rhs).map(
+                        |((left_guard, left_target), (right_guard, right_target))| {
+                            let guard = left_guard.and(right_guard);
+                            let target = left_target.iter().chain(right_target).copied().collect();
+                            (guard, target)
+                        },
+                    ))
+                    .collect()
             }
         }
     }
@@ -487,6 +586,47 @@ mod tests {
     }
 
     #[test]
+    fn test_release() {
+        let predicates = predicates();
+        let eq_a = PredicateId::new_unchecked(0);
+        let eq_b = PredicateId::new_unchecked(1);
+
+        let prop = Property::release(Property::atomic(eq_a), Property::atomic(eq_b));
+
+        let safety = prop.to_monitoring_automaton(&predicates);
+
+        // build the reference automaton
+        let mut reference = DeterministicSafetyAutomaton::builder(predicates.bdd_manager());
+        let state_1 = reference.new_state(Some("a R b"));
+        let state_2 = reference.new_state(Some("true"));
+        let a = predicates.bdd_variable(eq_a);
+        let b = predicates.bdd_variable(eq_b);
+        let reference = reference
+            .set_initial(state_1)
+            .add_edge(
+                state_1,
+                &predicates
+                    .bdd_manager()
+                    .mk_literal(a, false)
+                    .and(&predicates.bdd_manager().mk_literal(b, true)),
+                state_1,
+            )
+            .add_edge(
+                state_1,
+                &predicates
+                    .bdd_manager()
+                    .mk_literal(a, true)
+                    .and(&predicates.bdd_manager().mk_literal(b, true)),
+                state_2,
+            )
+            .add_edge(state_2, &predicates.bdd_manager().mk_true(), state_2)
+            .build()
+            .unwrap();
+
+        assert!(safety.is_equivalent_to(&reference));
+    }
+
+    #[test]
     fn test_true() {
         let predicates = predicates();
 
@@ -522,5 +662,18 @@ mod tests {
         let reference = reference.set_initial(state_1).build().unwrap();
 
         assert!(safety.is_equivalent_to(&reference));
+    }
+
+    #[test]
+    fn negation_normal_form() {
+        let eq_a = PredicateId::new_unchecked(0);
+        let eq_b = PredicateId::new_unchecked(1);
+
+        let prop = Property::until(Property::atomic(eq_a), Property::atomic(eq_b)).negate();
+        let prop_nnf = Property::release(
+            Property::atomic(eq_a).negate(),
+            Property::atomic(eq_b).negate(),
+        );
+        assert_eq!(prop.to_nnf(), prop_nnf);
     }
 }
