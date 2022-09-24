@@ -26,6 +26,7 @@ impl<T: 'static> Domain for T {}
 #[derive(Debug, Clone)]
 pub enum Property {
     // boolean
+    True,
     Atomic(PredicateId),
     Not(Box<Self>),
     And(Box<Self>, Box<Self>),
@@ -115,8 +116,8 @@ impl Property {
     #[must_use]
     pub fn is_in_nnf(&self) -> bool {
         match self {
-            Self::Atomic(_) => true,
-            Self::Not(subf) => matches!(subf.as_ref(), Self::Atomic(_)),
+            Self::True | Self::Atomic(_) => true,
+            Self::Not(subf) => matches!(subf.as_ref(), Self::True | Self::Atomic(_)),
             Self::And(lhs, rhs) | Self::Or(lhs, rhs) => lhs.is_in_nnf() && rhs.is_in_nnf(),
             Self::Always(subf) | Self::Finally(subf) | Self::Next(subf) => subf.is_in_nnf(),
         }
@@ -132,6 +133,13 @@ impl Property {
 
     fn to_nnf_core(&self, negated: bool) -> Self {
         match self {
+            Self::True => {
+                if negated {
+                    Self::Not(Self::True.into())
+                } else {
+                    Self::True
+                }
+            }
             Self::Atomic(_) => {
                 if negated {
                     Self::Not(self.clone().into())
@@ -183,6 +191,7 @@ impl Property {
 
     fn format<D: Domain>(&self, predicates: &Predicates<D>) -> String {
         match self {
+            Self::True => "true".to_string(),
             Self::Atomic(expr) => format!("({})", predicates[*expr]),
             Self::Not(subf) => format!("!{}", subf.format(predicates)),
             Self::And(lhs, rhs) => {
@@ -223,10 +232,14 @@ impl Property {
         automaton: &mut AutomatonBuilder<Alternating, Büchi>,
         accepting_sink: StateId,
     ) -> StateId {
+        if let Self::True = self {
+            return accepting_sink;
+        }
         let state = automaton.new_state(Some(&self.format(predicates)));
         let set = predicates.bdd_manager();
 
         match self {
+            Self::True => unreachable!("this case is handled before"),
             Self::Atomic(predicate) => {
                 automaton.add_edge(
                     state,
@@ -241,6 +254,9 @@ impl Property {
                         set.mk_literal(predicates.bdd_variable(*predicate), false),
                         hashset! {accepting_sink},
                     );
+                }
+                Self::True => {
+                    // the `false` state has no outgoing edges
                 }
                 _ => unreachable!("formula is in negation normal form"),
             },
@@ -296,6 +312,12 @@ impl Property {
         accepting_sink: StateId,
     ) -> Vec<(Bdd, HashSet<StateId>)> {
         match self {
+            Self::True => {
+                vec![(
+                    predicates.bdd_manager().mk_true(),
+                    hashset! {accepting_sink},
+                )]
+            }
             Self::Atomic(predictate) => {
                 vec![(
                     predicates
@@ -312,6 +334,9 @@ impl Property {
                             .mk_literal(predicates.bdd_variable(*predicate), false),
                         hashset! {accepting_sink},
                     )]
+                }
+                Self::True => {
+                    vec![(predicates.bdd_manager().mk_false(), HashSet::default())]
                 }
                 _ => unreachable!("formula is in negation normal form"),
             },
@@ -457,6 +482,44 @@ mod tests {
             )
             .build()
             .unwrap();
+
+        assert!(safety.is_equivalent_to(&reference));
+    }
+
+    #[test]
+    fn test_true() {
+        let predicates = predicates();
+
+        let prop = Property::True;
+
+        let safety = prop.to_monitoring_automaton(&predicates);
+        assert_eq!(safety.state_count(), 1);
+
+        // build the reference automaton
+        let mut reference = DeterministicSafetyAutomaton::builder(predicates.bdd_manager());
+        let state_1 = reference.new_state(Some("true"));
+        let reference = reference
+            .set_initial(state_1)
+            .add_edge(state_1, &predicates.bdd_manager().mk_true(), state_1)
+            .build()
+            .unwrap();
+
+        assert!(safety.is_equivalent_to(&reference));
+    }
+
+    #[test]
+    fn test_false() {
+        let predicates = predicates();
+
+        let prop = Property::Not(Property::True.into());
+
+        let safety = prop.to_monitoring_automaton(&predicates);
+        assert_eq!(safety.state_count(), 1);
+
+        // build the reference automaton
+        let mut reference = DeterministicSafetyAutomaton::builder(predicates.bdd_manager());
+        let state_1 = reference.new_state(Some("true"));
+        let reference = reference.set_initial(state_1).build().unwrap();
 
         assert!(safety.is_equivalent_to(&reference));
     }
